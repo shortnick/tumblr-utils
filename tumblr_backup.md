@@ -20,18 +20,28 @@ You can see an example of its output [on my home page](http://drbeat.li/tumblr).
    or clone the Github repo from `git://github.com/bbolli/tumblr-utils.git`.
 2. Copy or symlink `tumblr_backup.py` to a directory on your `$PATH` like
    `~/bin` or `/usr/local/bin`.
-3. Run `tumblr_backup.py` _blog-name_ as often as you like manually or from a
+3. Get your personal Tumblr API key. Before June 2020, the author's API key
+   was distributed with the source code, the then Tumblr denied access using
+   this key. Now, each user needs to get their own key at
+   <https://www.tumblr.com/oauth/apps>. Follow the instructions there; most
+   values entered don't matter. The API key must then be copied between the
+   single quotes in the source code at around line 105 (the line starts with
+   `API_KEY = `).
+4. Run `tumblr_backup.py` _blog-name_ as often as you like manually or from a
    cron job. The recommendation is to do a hourly incremental backup and a
    daily complete one.
 
 There are two optional dependencies that enable additional features:
 
 1. To backup audio and video, install [youtube-dl](https://rg3.github.io/youtube-dl/).
-2. To enable EXIF tagging, install [pyexiv2](http://tilloy.net/dev/pyexiv2/).
+   If you need HTTP cookies to download, use an appropriate browser plugin to
+   extract the cookie(s) into a file and use option `--cookiefile=file`. See
+   [issue 132](https://github.com/bbolli/tumblr-utils/issues/132).
+2. To enable EXIF tagging, install [pyexiv2](https://github.com/escaped/pyexiv2).
 
 The fastest option to install these packages is via the package manager of
 your operating system (apt-get, synaptic, yum, brew, etc). If this is not
-feasible, download and install from the links above.
+feasible, download, build and install from the links above.
 
 
 ## 2. Usage
@@ -48,13 +58,17 @@ feasible, download and install from the links above.
     -D, --dirs            save each post in its own folder
     -q, --quiet           suppress progress messages
     -i, --incremental     incremental backup mode
+    -l, --likes           save a blog's likes, not its posts
     -j, --json            save the original JSON source
     -k, --skip-images     do not save images; link to Tumblr instead
-    --save-video          save video files
+    --save-video          save all video files
+    --save-video-tumblr   save only Tumblr video files
     --save-audio          save audio files
+    --cookiefile=FILE     cookie file for youtube-dl
     -b, --blosxom         save the posts in blosxom format
     -r, --reverse-month   reverse the post order in the monthly archives
     -R, --reverse-index   reverse the index file order
+    --tag-index           also create an archive per tag
     -a HOUR, --auto=HOUR  do a full backup at HOUR hours, otherwise do an
                           incremental backup (useful for cron jobs)
     -n COUNT, --count=COUNT
@@ -98,7 +112,8 @@ If your blog is under `.tumblr.com`, you can give just the first domain name
 part; if your blog is under your own domain, give the whole domain name. You
 can give more than one _blog-name_ to backup multiple blogs in one go.
 
-The default blog name can be changed in the script.
+The default blog name(s) can be changed by copying `settings.py.example` to
+`settings.py` and adding the name(s) to the `DEFAULT_BLOGS` list.
 
 ### Environment variables
 
@@ -110,11 +125,6 @@ determine the locale for month names and the date/time format.
 The exit code is 0 if at least one post has been backed up, 1 if no post has
 been backed up, 2 on invocation errors, 3 if the backup was interrupted, or 4
 on HTTP errors.
-
-### Backup via settings.py
-
-To backup a list of tumblr addresses, copy `settings.py.example` to  
-`settings.py`, and add the addresses to the list in that file.
 
 
 ## 3. Operation
@@ -143,6 +153,11 @@ The generated directory structure looks like this:
             json/
                 <id>.json - the original JSON posts
                 …
+            tags/
+                index.html - the index of all tag indices
+                <tag>/index.html - the index for <tag>
+                    archive/
+                        <yyyy-mm-pnn>.html - the monthly pages for <tag>
             theme/
                 avatar.<ext> - the blog’s avatar
                 style.css - the blog’s style sheet
@@ -188,6 +203,9 @@ The index pages are recreated from scratch after every backup, based on the
 existing single post pages. Normally, the index and monthly pages are in
 reverse chronological order, i.e. more recent entries on top. The options `-R`
 and `-r` can be used to reverse the order.
+
+Option `--tag-index` creates a tag index for each tag used in the posts.
+It can be reached through the "Tag index" link in the main index.
 
 If you want to use a custom CSS file, call it `custom.css`, put it in the
 backup folder and do a complete backup. Without a custom CSS file,

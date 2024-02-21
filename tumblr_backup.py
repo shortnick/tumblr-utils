@@ -8,6 +8,7 @@ from collections import defaultdict
 from datetime import datetime
 import errno
 from glob import glob
+import hashlib
 from httplib import HTTPException
 import imghdr
 try:
@@ -82,6 +83,7 @@ backup_css = 'backup.css'
 custom_css = 'custom.css'
 avatar_base = 'avatar'
 dir_index = 'index.html'
+tag_index_dir = 'tags'
 
 blog_name = ''
 post_ext = '.html'
@@ -99,8 +101,8 @@ MAX_POSTS = 50
 HTTP_TIMEOUT = 90
 HTTP_CHUNK_SIZE = 1024 * 1024
 
-# bb-tumblr-backup API key
-API_KEY = '8YUsKJvcJxo2MDwmWMDiXZGuMuIbeCwuQGP5ZHSEA4jBJPMnJT'
+# get your own API key at https://www.tumblr.com/oauth/apps
+API_KEY = ''
 
 # ensure the right date/time format
 try:
@@ -173,7 +175,9 @@ def get_api_url(account):
     blog_name = account
     if '.' not in account:
         blog_name += '.tumblr.com'
-    return 'https://api.tumblr.com/v2/blog/' + blog_name + '/posts'
+    return 'https://api.tumblr.com/v2/blog/%s/%s' % (
+        blog_name, 'likes' if options.likes else 'posts'
+    )
 
 
 def set_period():
@@ -201,7 +205,12 @@ def apiparse(base, count, start=0):
             resp = urlopen(url)
             data = resp.read()
         except (EnvironmentError, HTTPException) as e:
-            sys.stderr.write("%s getting %s\n" % (e, url))
+            if getattr(e, 'code', None) == 429:
+                delay = int(e.headers['X-Ratelimit-Perhour-Reset'])
+                sys.stderr.write("Hitting rate limit; sleeping for %d seconds...\n" % delay)
+                time.sleep(delay + 2)
+            else:
+                sys.stderr.write("%s getting %s\n" % (e, url))
             continue
         if resp.info().gettype() == 'application/json':
             break
@@ -252,6 +261,7 @@ header > img { float: right; }
 img { max-width: 720px; }
 blockquote { margin-left: 0; border-left: 8px #999 solid; padding: 0 24px; }
 .archive h1, .subtitle, article { padding-bottom: 0.75em; border-bottom: 1px #ccc dotted; }
+article[class^="liked-"] { background-color: #f0f0f8; }
 .post a.llink { display: none; }
 header a, footer a { text-decoration: none; }
 footer, article footer a { font-size: small; color: #999; }
@@ -288,53 +298,47 @@ def get_style():
         return
 
 
-class TumblrBackup:
+class Index:
 
-    def __init__(self):
-        self.errors = False
-        self.total_count = 0
+    def __init__(self, blog, body_class='index'):
+        self.blog = blog
+        self.body_class = body_class
+        self.index = defaultdict(lambda: defaultdict(list))
 
-    def exit_code(self):
-        if self.errors:
-            return EXIT_ERRORS
-        if self.total_count == 0:
-            return EXIT_NOPOSTS
-        return EXIT_SUCCESS
+    def add_post(self, post):
+        self.index[post.tm.tm_year][post.tm.tm_mon].append(post)
+        return self
 
-    def build_index(self):
-        filter = join('*', dir_index) if options.dirs else '*' + post_ext
-        for f in glob(path_to(post_dir, filter)):
-            post = LocalPost(f)
-            self.index[post.tm.tm_year][post.tm.tm_mon].append(post)
+    def save_index(self, index_dir='.', title=None):
         self.archives = sorted(((y, m) for y in self.index for m in self.index[y]),
             reverse=options.reverse_month
         )
-
-    def save_index(self):
-        f = glob(path_to(theme_dir, avatar_base + '.*'))
-        avatar = split(f[0])[1] if f else None
-        with open_text(dir_index) as idx:
-            idx.write(self.header(self.title, body_class='index',
-                subtitle=self.subtitle, avatar=avatar
-            ))
+        subtitle = self.blog.title if title else self.blog.subtitle
+        title = title or self.blog.title
+        with open_text(index_dir, dir_index) as idx:
+            idx.write(self.blog.header(title, self.body_class, subtitle, True))
+            if options.tag_index and self.body_class == 'index':
+                idx.write('<p><a href=%s/%s>Tag index</a></p>\n' % (
+                    tag_index_dir, dir_index
+                ))
             for year in sorted(self.index.keys(), reverse=options.reverse_index):
-                self.save_year(idx, year)
+                self.save_year(idx, index_dir, year)
             idx.write(u'<footer><p>Generated on %s by <a href=https://github.com/'
                 'bbolli/tumblr-utils>tumblr-utils</a>.</p></footer>\n' % strftime('%x %X')
             )
 
-    def save_year(self, idx, year):
+    def save_year(self, idx, index_dir, year):
         idx.write('<h3>%s</h3>\n<ul>\n' % year)
         for month in sorted(self.index[year].keys(), reverse=options.reverse_index):
             tm = time.localtime(time.mktime([year, month, 3, 0, 0, 0, 0, 0, -1]))
-            month_name = self.save_month(year, month, tm)
+            month_name = self.save_month(index_dir, year, month, tm)
             idx.write(u'    <li><a href=%s/%s title="%d post(s)">%s</a></li>\n' % (
                 archive_dir, month_name, len(self.index[year][month]),
                 strftime('%B', tm)
             ))
         idx.write('</ul>\n\n')
 
-    def save_month(self, year, month, tm):
+    def save_month(self, index_dir, year, month, tm):
         posts = sorted(self.index[year][month], key=lambda x: x.date, reverse=options.reverse_month)
         posts_month = len(posts)
         posts_page = options.posts_per_page if options.posts_per_page >= 1 else posts_month
@@ -354,20 +358,20 @@ class TumblrBackup:
         pages_month = pages_per_month(year, month)
         for page, start in enumerate(range(0, posts_month, posts_page), start=1):
 
-            archive = [self.header(strftime('%B %Y', tm), body_class='archive')]
+            archive = [self.blog.header(strftime('%B %Y', tm), body_class='archive')]
             archive.extend(p.get_post() for p in posts[start:start + posts_page])
 
             file_name = FILE_FMT % (year, month, page)
             if options.dirs:
                 base = save_dir + archive_dir + '/'
                 suffix = '/'
-                arch = open_text(archive_dir, file_name, dir_index)
+                arch = open_text(index_dir, archive_dir, file_name, dir_index)
                 file_name += suffix
             else:
                 base = ''
                 suffix = post_ext
                 file_name += suffix
-                arch = open_text(archive_dir, file_name)
+                arch = open_text(index_dir, archive_dir, file_name)
 
             if page > 1:
                 pp = FILE_FMT % (year, month, page - 1)
@@ -382,14 +386,77 @@ class TumblrBackup:
                 ny, nm = next_month(+1)
                 np = FILE_FMT % (ny, nm, 1) if ny else ''
 
-            archive.append(self.footer(base, pp, np, suffix))
+            archive.append(self.blog.footer(base, pp, np, suffix))
 
             arch.write('\n'.join(archive))
 
         return first_file
 
-    def header(self, title='', body_class='', subtitle='', avatar=''):
-        root_rel = '' if body_class == 'index' else save_dir
+
+class Indices:
+
+    def __init__(self, blog):
+        self.blog = blog
+        self.main_index = Index(blog)
+        self.tags = defaultdict(lambda: Index(blog, 'tag-archive'))
+
+    def build_index(self):
+        filter = join('*', dir_index) if options.dirs else '*' + post_ext
+        self.all_posts = map(LocalPost, glob(path_to(post_dir, filter)))
+        for post in self.all_posts:
+            self.main_index.add_post(post)
+            if options.tag_index:
+                for tag, name in post.tags:
+                    self.tags[tag].add_post(post).name = name
+
+    def save_index(self):
+        self.main_index.save_index()
+        if options.tag_index:
+            self.save_tag_index()
+
+    def save_tag_index(self):
+        global save_dir
+        save_dir = '../../../'
+        mkdir(path_to(tag_index_dir))
+        self.fixup_media_links()
+        tag_index = [self.blog.header('Tag index', 'tag-index', self.blog.title, True), '<ul>']
+        for tag, index in sorted(self.tags.items(), key=lambda kv: kv[1].name):
+            digest = hashlib.md5(tag).hexdigest()
+            index.save_index(tag_index_dir + os.sep + digest,
+                u"Tag ‛%s’" % index.name
+            )
+            tag_index.append(u'    <li><a href=%s/%s>%s</a></li>' % (
+                digest, dir_index, escape(index.name)
+            ))
+        tag_index.extend(['</ul>', ''])
+        with open_text(tag_index_dir, dir_index) as f:
+            f.write(u'\n'.join(tag_index))
+
+    def fixup_media_links(self):
+        """Fixup all media links which now have to be two folders lower."""
+        shallow_media = '../' + media_dir
+        deep_media = save_dir + media_dir
+        for p in self.all_posts:
+            p.post = p.post.replace(shallow_media, deep_media)
+
+
+class TumblrBackup:
+
+    def __init__(self):
+        self.errors = False
+        self.total_count = 0
+
+    def exit_code(self):
+        if self.errors:
+            return EXIT_ERRORS
+        if self.total_count == 0:
+            return EXIT_NOPOSTS
+        return EXIT_SUCCESS
+
+    def header(self, title='', body_class='', subtitle='', avatar=False):
+        root_rel = {
+            'index': '', 'tag-index': '../', 'tag-archive': '../../'
+        }.get(body_class, save_dir)
         css_rel = root_rel + (custom_css if have_custom_css else backup_css)
         if body_class:
             body_class = ' class=' + body_class
@@ -404,7 +471,9 @@ class TumblrBackup:
 <header>
 ''' % (encoding, self.title, css_rel, body_class)
         if avatar:
-            h += '<img src=%s%s/%s alt=Avatar>\n' % (root_rel, theme_dir, avatar)
+            f = glob(path_to(theme_dir, avatar_base + '.*'))
+            if f:
+                h += '<img src=%s%s/%s alt=Avatar>\n' % (root_rel, theme_dir, split(f[0])[1])
         if title:
             h += u'<h1>%s</h1>\n' % title
         if subtitle:
@@ -414,7 +483,7 @@ class TumblrBackup:
 
     def footer(self, base, previous_page, next_page, suffix):
         f = '<footer><nav>'
-        f += '<a href=%s rel=index>Index</a>\n' % save_dir
+        f += '<a href=%s%s rel=index>Index</a>\n' % (save_dir, dir_index)
         if previous_page:
             f += '| <a href=%s%s%s rel=prev>Previous</a>\n' % (base, previous_page, suffix)
         if next_page:
@@ -424,9 +493,6 @@ class TumblrBackup:
 
     def backup(self, account):
         """makes single files and an index for every post on a public Tumblr blog account"""
-
-        self.index = defaultdict(lambda: defaultdict(list))
-        self.archives = []
 
         base = get_api_url(account)
 
@@ -473,25 +539,27 @@ class TumblrBackup:
 
         # collect all the meta information
         resp = soup['response']
-        blog = resp['blog']
-        try:
-            self.title = escape(blog['title'])
-        except KeyError:
-            self.title = account
-        self.subtitle = blog['description']
+        if options.likes:
+            _get_content = lambda soup: soup['response']['liked_posts']
+            blog = {}
+            count_estimate = resp['liked_count']
+        else:
+            _get_content = lambda soup: soup['response']['posts']
+            blog = resp['blog']
+            count_estimate = blog['posts']
+        self.title = escape(blog.get('title', account))
+        self.subtitle = blog.get('description', '')
 
         # use the meta information to create a HTML header
         TumblrPost.post_header = self.header(body_class='post')
 
-        # find the post number limit to back up
-        last_post = blog['posts']
-        if options.count:
-            last_post = min(last_post, options.count + options.skip)
-
+        # returns whether any posts from this batch were saved
         def _backup(posts):
             for p in sorted(posts, key=lambda x: x['id'], reverse=True):
                 post = post_class(p)
                 if ident_max and long(post.ident) <= ident_max:
+                    return False
+                if options.count and self.post_count >= options.count:
                     return False
                 if options.period:
                     if post.date >= options.p_stop:
@@ -516,31 +584,32 @@ class TumblrBackup:
                 self.post_count += 1
             return True
 
+        prev_ids = []
         # start the thread pool
         backup_pool = ThreadPool()
         try:
-            # Get the JSON entries from the API, which we can only do for max 50 posts at once.
+            # Get the JSON entries from the API, which we can only do for MAX_POSTS posts at once.
             # Posts "arrive" in reverse chronological order. Post #0 is the most recent one.
-            last_batch = MAX_POSTS
             i = options.skip
-            while i < last_post:
+            while True:
                 # find the upper bound
-                j = min(i + MAX_POSTS, last_post)
-                log(account, "Getting posts %d to %d of %d\r" % (i, j - 1, last_post))
+                log(account, "Getting posts %d to %d (of %d expected)\r" % (i, i + MAX_POSTS - 1, count_estimate))
 
-                soup = apiparse(base, j - i, i)
+                soup = apiparse(base, MAX_POSTS, i)
                 if soup is None:
-                    i += last_batch     # try the next batch
+                    i += 1 # try skipping a post
                     self.errors = True
                     continue
 
-                posts = soup['response']['posts']
-                # posts can be empty if we don't backup reblogged posts
-                if not posts or not _backup(posts):
+                posts = _get_content(soup)
+                ids = [p['id'] for p in posts]
+                # `_backup(posts)` can be empty even when `posts` is not if we don't backup reblogged posts
+                if not ids or ids == prev_ids or not _backup(posts):
+                    log(account, "done\r")
                     break
 
-                last_batch = len(posts)
-                i += last_batch
+                i += MAX_POSTS
+                prev_ids = ids
         except:
             # ensure proper thread pool termination
             backup_pool.cancel()
@@ -555,8 +624,9 @@ class TumblrBackup:
             get_style()
             if not have_custom_css:
                 save_style()
-            self.build_index()
-            self.save_index()
+            ix = Indices(self)
+            ix.build_index()
+            ix.save_index()
 
         log(account, "%d posts backed up\n" % self.post_count)
         self.total_count += self.post_count
@@ -570,16 +640,19 @@ class TumblrPost:
         self.content = ''
         self.post = post
         self.json_content = json.dumps(post, sort_keys=True, indent=4, separators=(',', ': '))
+        self.creator = post['blog_name']
         self.ident = str(post['id'])
         self.url = post['post_url']
         self.shorturl = post['short_url']
-        self.typ = post['type']
+        self.typ = str(post['type'])
         self.date = post['timestamp']
         self.isodate = datetime.utcfromtimestamp(self.date).isoformat() + 'Z'
         self.tm = time.localtime(self.date)
         self.title = ''
         self.tags = post['tags']
         self.note_count = post.get('note_count', 0)
+        self.reblogged_from = post.get('reblogged_from_url')
+        self.reblogged_root = post.get('reblogged_root_url')
         self.source_title = post.get('source_title', '')
         self.source_url = post.get('source_url', '')
         if options.request:
@@ -602,8 +675,17 @@ class TumblrPost:
             elt = get_try(elt)
             if elt:
                 if options.save_images:
-                    elt = re.sub(r'''(?i)(<img [^>]*\bsrc\s*=\s*["'])(.*?)(["'][^>]*>)''',
+                    elt = re.sub(r'''(?i)(<img\s(?:[^>]*\s)?src\s*=\s*["'])(.*?)(["'][^>]*>)''',
                         self.get_inline_image, elt
+                    )
+                if options.save_video or options.save_video_tumblr:
+                    # Handle video element poster attribute
+                    elt = re.sub(r'''(?i)(<video\s(?:[^>]*\s)?poster\s*=\s*["'])(.*?)(["'][^>]*>)''',
+                        self.get_inline_video_poster, elt
+                    )
+                    # Handle video element's source sub-element's src attribute
+                    elt = re.sub(r'''(?i)(<source\s(?:[^>]*\s)?src\s*=\s*["'])(.*?)(["'][^>]*>)''',
+                        self.get_inline_video, elt
                     )
                 append(elt, fmt)
 
@@ -619,7 +701,7 @@ class TumblrPost:
             url = get_try('link_url')
             is_photoset = len(post['photos']) > 1
             for offset, p in enumerate(post['photos'], start=1):
-                o = p['original_size']
+                o = p['alt_sizes'][0] if 'alt_sizes' in p else p['original_size']
                 src = o['url']
                 if options.save_images:
                     src = self.get_image_url(src, offset if is_photoset else 0)
@@ -642,15 +724,15 @@ class TumblrPost:
 
         elif self.typ == 'video':
             src = ''
-            if options.save_video:
-                if post['video_type'] == 'tumblr':
-                    src = self.get_media_url(post['video_url'], '.mp4')
-                elif youtube_dl:
-                    src = self.get_youtube_url(self.url)
-                    if not src:
-                        sys.stdout.write(u'Unable to download video in post #%s%-50s\n' %
-                            (self.ident, ' ')
-                        )
+            if (options.save_video or options.save_video_tumblr) \
+            and post['video_type'] == 'tumblr':
+                src = self.get_media_url(post['video_url'], '.mp4')
+            elif options.save_video:
+                src = self.get_youtube_url(self.url)
+                if not src:
+                    sys.stdout.write(u'Unable to download video in post #%s%-50s\n' %
+                        (self.ident, ' ')
+                    )
             if src:
                 append(u'<p><video controls><source src="%s" type=video/mp4>%s<br>\n<a href="%s">%s</a></video></p>' % (
                     src, "Your browser does not support the video element.", src, "Video file"
@@ -662,15 +744,15 @@ class TumblrPost:
         elif self.typ == 'audio':
             src = ''
             if options.save_audio:
+                audio_url = get_try('audio_url') or get_try('audio_source_url')
                 if post['audio_type'] == 'tumblr':
-                    audio_url = post['audio_url']
-                    if audio_url.startswith('http://a.tumblr.com/'):
+                    if audio_url.startswith('https://a.tumblr.com/'):
                         src = self.get_media_url(audio_url, '.mp3')
                     elif audio_url.startswith('https://www.tumblr.com/audio_file/'):
-                        audio_url = u'http://a.tumblr.com/%so1.mp3' % audio_url.split('/')[-1]
+                        audio_url = u'https://a.tumblr.com/%so1.mp3' % audio_url.split('/')[-1]
                         src = self.get_media_url(audio_url, '.mp3')
                 elif post['audio_type'] == 'soundcloud':
-                    src = self.get_media_url(post['audio_url'], '.mp3')
+                    src = self.get_media_url(audio_url, '.mp3')
             if src:
                 append(u'<p><audio controls><source src="%s" type=audio/mpeg>%s<br>\n<a href="%s">%s</a></audio></p>' % (
                     src, "Your browser does not support the audio element.", src, "Audio file"
@@ -707,17 +789,20 @@ class TumblrPost:
     def get_youtube_url(self, youtube_url):
         # determine the media file name
         filetmpl = u'%(id)s_%(uploader_id)s_%(title)s.%(ext)s'
-        ydl = youtube_dl.YoutubeDL({
+        ydl_options = {
             'outtmpl': join(self.media_folder, filetmpl),
-            'quiet': True, 
-            'restrictfilenames': True, 
+            'quiet': True,
+            'restrictfilenames': True,
             'noplaylist': True,
             'continuedl': True,
             'nooverwrites': True,
-            'retries': 3000,		
+            'retries': 3000,
             'fragment_retries': 3000,
             'ignoreerrors': True
-        })
+        }
+        if options.cookiefile:
+            ydl_options['cookiefile'] = options.cookiefile
+        ydl = youtube_dl.YoutubeDL(ydl_options)
         ydl.add_default_info_extractors()
         try:
             result = ydl.extract_info(youtube_url, download=False)
@@ -734,6 +819,8 @@ class TumblrPost:
         return u'%s/%s' % (self.media_url, split(media_filename)[1])
 
     def get_media_url(self, media_url, extension):
+        if not media_url:
+            return ''
         media_filename = self.get_filename(media_url)
         media_filename = os.path.splitext(media_filename)[0] + extension
         saved_name = self.download_media(media_url, media_filename)
@@ -744,15 +831,11 @@ class TumblrPost:
     def get_image_url(self, image_url, offset):
         """Saves an image if not saved yet. Returns the new URL or
         the original URL in case of download errors."""
-
-        def _addexif(fn):
-            if options.exif and fn.endswith('.jpg'):
-                add_exif(fn, set(self.tags))
-
         image_filename = self.get_filename(image_url, '_o%s' % offset if offset else '')
         saved_name = self.download_media(image_url, image_filename)
         if saved_name is not None:
-            _addexif(join(self.media_folder, saved_name))
+            if options.exif and saved_name.endswith('.jpg'):
+                add_exif(join(self.media_folder, saved_name), set(self.tags))
             image_url = u'%s/%s' % (self.media_url, saved_name)
         return image_url
 
@@ -766,22 +849,30 @@ class TumblrPost:
     def get_inline_image(self, match):
         """Saves an inline image if not saved yet. Returns the new <img> tag or
         the original one in case of download errors."""
+        return InlineMedia(match, maximize=True).download(self)
 
-        image_url = match.group(2)
-        if image_url.startswith('//'):
-            image_url = 'http:' + image_url
-        image_url = self.maxsize_image_url(image_url)
-        path = urlparse.urlparse(image_url).path
-        image_filename = path.split('/')[-1]
-        if not image_filename or not image_url.startswith('http'):
+    def get_inline_video_poster(self, match):
+        """Saves an inline video poster if not saved yet. Returns the new
+        <video> tag or the original one in case of download errors."""
+        # get rid of autoplay and muted attributes to align with normal video
+        # download behaviour
+        return InlineMedia(match).download(self) \
+            .replace('autoplay="autoplay"', '').replace('muted="muted"', '')
+
+    def get_inline_video(self, match):
+        """Saves an inline video if not saved yet. Returns the new <video> tag
+        or the original one in case of download errors."""
+        media = InlineMedia(match)
+        if not media.valid():
             return match.group(0)
-
-        saved_name = self.download_media(image_url, image_filename)
+        saved_name = None
+        if '.tumblr.com/' in media.url:
+            saved_name = self.get_media_url(media.url, '.mp4')
+        elif options.save_video:
+            saved_name = self.get_youtube_url(media.url)
         if saved_name is None:
             return match.group(0)
-        return u'%s%s/%s%s' % (match.group(1), self.media_url,
-            saved_name, match.group(3)
-        )
+        return u'%s%s%s' % (match.group(1), saved_name, match.group(3))
 
     def get_filename(self, url, offset=''):
         """Determine the image file name depending on options.image_names"""
@@ -790,7 +881,8 @@ class TumblrPost:
         elif options.image_names == 'bi':
             return account + '_' + self.ident + offset
         else:
-            return url.split('/')[-1]
+            # delete characters not allowed under Windows
+            return re.sub(r'[:<>"/\\|*?]', '', url.split('/')[-1])
 
     def download_media(self, url, filename):
         # check if a file with this name already exists
@@ -828,10 +920,19 @@ class TumblrPost:
 
     def get_post(self):
         """returns this post in HTML"""
-        post = self.post_header + u'<article class=%s id=p-%s>\n' % (self.typ, self.ident)
-        post += u'<header>\n<p><time datetime=%s>%s</time>\n' % (self.isodate, strftime('%x %X', self.tm))
+        typ = ('liked-' if options.likes else '') + self.typ
+        post = self.post_header + u'<article class=%s id=p-%s>\n' % (typ, self.ident)
+        post += u'<header>\n'
+        if options.likes:
+            post += u'<p><a href=\"http://{0}.tumblr.com/\" class=\"tumblr_blog\">{0}</a>:</p>\n'.format(self.creator)
+        post += u'<p><time datetime=%s>%s</time>\n' % (self.isodate, strftime('%x %X', self.tm))
         post += u'<a class=llink href=%s%s/%s>¶</a>\n' % (save_dir, post_dir, self.llink)
-        post += u'<a href=%s>●</a></header>\n' % self.shorturl
+        post += u'<a href=%s>●</a>\n' % self.shorturl
+        if self.reblogged_from and self.reblogged_from != self.reblogged_root:
+            post += u'<a href=%s>⬀</a>\n' % self.reblogged_from
+        if self.reblogged_root:
+            post += u'<a href=%s>⬈</a>\n' % self.reblogged_root
+        post += '</header>\n'
         if self.title:
             post += u'<h2>%s</h2>\n' % self.title
         post += self.content
@@ -889,12 +990,19 @@ class LocalPost:
 
     def __init__(self, post_file):
         with codecs.open(post_file, 'r', encoding) as f:
-            self.lines = f.readlines()
+            post = f.read()
+        # extract all URL-encoded tags
+        self.tags = []
+        footer_pos = post.find('<footer>')
+        if footer_pos > 0:
+            self.tags = re.findall(r'(?m)<a.+?/tagged/(.+?)>#(.+?)</a>', post[footer_pos:])
         # remove header and footer
-        while self.lines and '<article ' not in self.lines[0]:
-            del self.lines[0]
-        while self.lines and '</article>' not in self.lines[-1]:
-            del self.lines[-1]
+        lines = post.split('\n')
+        while lines and '<article ' not in lines[0]:
+            del lines[0]
+        while lines and '</article>' not in lines[-1]:
+            del lines[-1]
+        self.post = '\n'.join(lines)
         parts = post_file.split(os.sep)
         if parts[-1] == dir_index:  # .../<post_id>/index.html
             self.file_name = os.sep.join(parts[-2:])
@@ -906,7 +1014,34 @@ class LocalPost:
         self.tm = time.localtime(self.date)
 
     def get_post(self):
-        return u''.join(self.lines)
+        return self.post
+
+
+class InlineMedia:
+
+    def __init__(self, match, maximize=False):
+        url = match.group(2)
+        if url.startswith('//'):
+            url = 'https:' + url
+        if maximize:
+            url = TumblrPost.maxsize_image_url(url)
+        path = urlparse.urlparse(url).path
+        self.filename = path.split('/')[-1]
+        self.match = match
+        self.url = url
+
+    def valid(self):
+        return self.filename and self.url.startswith('http')
+
+    def download(self, post):
+        if not self.valid():
+            return self.match.group(0)
+        saved_name = post.download_media(self.url, self.filename)
+        if saved_name is None:
+            return self.match.group(0)
+        return u'%s%s/%s%s' % (self.match.group(1), post.media_url,
+            saved_name, self.match.group(3)
+        )
 
 
 class ThreadPool:
@@ -988,11 +1123,16 @@ if __name__ == '__main__':
     parser.add_option('-i', '--incremental', action='store_true',
         help="incremental backup mode"
     )
+    parser.add_option('-l', '--likes', action='store_true',
+        dest='likes', help="save a blog's likes, not its posts"
+    )
     parser.add_option('-k', '--skip-images', action='store_false', default=True,
         dest='save_images', help="do not save images; link to Tumblr instead"
     )
-    parser.add_option('--save-video', action='store_true', help="save video files")
+    parser.add_option('--save-video', action='store_true', help="save all video files")
+    parser.add_option('--save-video-tumblr', action='store_true', help="save only Tumblr video files")
     parser.add_option('--save-audio', action='store_true', help="save audio files")
+    parser.add_option('--cookiefile', help="cookie file for youtube-dl", metavar='FILE')
     parser.add_option('-j', '--json', action='store_true',
         help="save the original JSON source"
     )
@@ -1004,6 +1144,9 @@ if __name__ == '__main__':
     )
     parser.add_option('-R', '--reverse-index', action='store_false', default=True,
         help="reverse the index file order"
+    )
+    parser.add_option('--tag-index', action='store_true',
+        help="also create an archive per tag"
     )
     parser.add_option('-a', '--auto', type='int', metavar="HOUR",
         help="do a full backup at HOUR hours, otherwise do an incremental backup"
@@ -1072,10 +1215,22 @@ if __name__ == '__main__':
         parser.error("Missing blog-name")
     if options.outdir and len(args) > 1:
         parser.error("-O can only be used for a single blog-name")
+    if options.dirs and options.tag_index:
+        parser.error("-D cannot be used with --tag-index")
     if options.exif and not pyexiv2:
-        parser.error("--exif: module 'pyexif2' is not installed")
-    if (options.save_video or options.save_audio) and not youtube_dl:
-        parser.error("--save-video/-audio: module 'youtube_dl' is not installed")
+        parser.error("--exif: module 'pyexiv2' is not installed")
+    if options.save_video and not youtube_dl:
+        parser.error("--save-video: module 'youtube_dl' is not installed")
+
+    try:
+        from settings import API_KEY
+    except ImportError:
+        pass
+    if not API_KEY:
+        sys.stderr.write('''\
+Missing API_KEY; please get your own API key at
+https://www.tumblr.com/oauth/apps\n''')
+        sys.exit(1)
 
     tb = TumblrBackup()
     try:
