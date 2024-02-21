@@ -1,3 +1,6 @@
 DEFAULT_BLOGS = [
     'example',
 ]
+
+
+tumblr_backup.py --json --save-video --save-audio mumblemouth
